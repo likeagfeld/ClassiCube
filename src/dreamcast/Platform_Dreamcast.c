@@ -751,7 +751,11 @@ static void TryInitSDCard(void) {
 
 #define SERIAL_AT_RETRIES   1      // single AT probe, like W5500/BBA/modem (fail fast, fall through)
 #define SERIAL_AT_TIMEOUT   2000   // ms to wait for "OK" per AT probe
-#define SERIAL_CONN_TIMEOUT 5000   // ms to wait for "CONNECT" after dialing
+#define SERIAL_CONN_TIMEOUT 15000  // ms to wait for "CONNECT" after dialing.
+                                   // DreamPi 2 sets up its alias interface before
+                                   // launching pppd, so CONNECT can arrive ~6-7s
+                                   // after "Call answered!" - 5s was too tight and
+                                   // the DC bailed before PPP. Exits early on CONNECT.
 
 static void scif_write_string(const char* str) {
 	while (*str) scif_write(*str++);
