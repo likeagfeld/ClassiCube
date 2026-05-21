@@ -26,6 +26,9 @@
 #include <fat/fs_fat.h>
 #include <kos/dbgio.h>
 #include <dc/net/w5500_adapter.h>
+#include <dc/scif.h>
+#include <dc/modem/modem.h>
+#include <arch/timer.h>
 
 KOS_INIT_FLAGS(INIT_CONTROLLER | INIT_KEYBOARD | INIT_MOUSE |
                INIT_VMU        | INIT_CDROM    | INIT_NET   | INIT_FS_RAMDISK);
@@ -727,6 +730,150 @@ static void TryInitSDCard(void) {
 	Platform_Log1("ROOT DIRECTORY CREATE: %i", &res);
 }
 
+/*########################################################################################################################*
+*--------------------------------------------------Serial coders cable (PPP)----------------------------------------------*
+*#########################################################################################################################*/
+// Establishes networking over the serial port ("coders cable") by speaking the
+//  DreamPi 2 AT protocol on SCIF at 115200 baud and then bringing up PPP over SCIF.
+// This shares the single physical serial connector with the W5500 adapter, the
+//  SD-card-over-serial path, and KOS debug logging - so it is attempted FIRST and,
+//  while active, fully owns the port (W5500/SD init are skipped on success).
+//
+// CRITICAL: KOS routes printf()/dbgio through SCIF. Once we touch SCIF for data,
+//  ANY serial debug output would be injected into the AT/PPP byte stream and seen
+//  by DreamPi as corruption. So we disable dbgio + serial logging up front and use
+//  only on-screen logging (LogOnscreen, via Platform_LogConst with log_debugger=0).
+
+#define SERIAL_AT_RETRIES   3      // AT probes before giving up (instant when DreamPi answers)
+#define SERIAL_AT_TIMEOUT   2000   // ms to wait for "OK" per AT probe
+#define SERIAL_CONN_TIMEOUT 5000   // ms to wait for "CONNECT" after dialing
+
+static void scif_write_string(const char* str) {
+	while (*str) scif_write(*str++);
+}
+
+static void scif_drain(void) {
+	while (scif_read() != -1) { /* discard pending bytes */ }
+}
+
+// Returns true on success (net_default_dev now points at the PPP link).
+static cc_bool InitSerialCable(void) {
+	char buf[64];
+	int  bytes_read, attempt, c;
+	uint64 start_time;
+	int  got_ok = 0;
+
+	Platform_LogConst("Checking for serial cable..");
+
+	// From here on SCIF carries data: kill all serial debug output so it can
+	//  never leak into the AT/PPP stream (the W5500 path re-enables it on fallback).
+	log_debugger = false;
+	dbgio_disable();
+
+	// Bring SCIF up in polled mode at the DreamPi 2 serial rate
+	scif_init();
+	scif_set_irq_usage(0);          // polling, not IRQ-driven
+	scif_set_parameters(115200, 1); // 115200 baud, FIFO enabled
+
+	// Thoroughly drain any boot/garbage bytes
+	timer_spin_sleep(200); scif_drain();
+	timer_spin_sleep(100); scif_drain();
+
+	// Wake the line: a plain-text preamble + CR/LF, then normalise the modem
+	//  command profile (echo on, verbose result codes) so "OK" is actually emitted.
+	//  Some DreamPi states suppress result codes until this is sent.
+	scif_write_string("ClassiCube: serial link check\r\n"); scif_flush();
+	timer_spin_sleep(100);
+	scif_write_string("\r\n"); scif_flush();
+	timer_spin_sleep(120);
+	scif_write_string("ATE1Q0V1\r\n"); scif_flush();
+	timer_spin_sleep(180); scif_drain();
+	timer_spin_sleep(60);
+
+	for (attempt = 0; attempt < SERIAL_AT_RETRIES && !got_ok; attempt++) {
+		if (attempt > 0) {
+			Platform_LogConst("Retrying serial AT command..");
+			timer_spin_sleep(300); scif_drain(); timer_spin_sleep(180);
+		} else {
+			Platform_LogConst("Sending AT command..");
+		}
+
+		scif_write_string("AT\r\n"); scif_flush();
+		timer_spin_sleep(700);       // let DreamPi process before reading
+
+		memset(buf, 0, sizeof(buf));
+		bytes_read = 0;
+		start_time = timer_ms_gettime64();
+		while ((timer_ms_gettime64() - start_time) < SERIAL_AT_TIMEOUT) {
+			c = scif_read();
+			if (c != -1 && bytes_read < (int)sizeof(buf) - 1) {
+				buf[bytes_read++] = (char)c;
+				buf[bytes_read]   = '\0';
+				if (strstr(buf, "OK")) { got_ok = 1; break; }
+			}
+			timer_spin_sleep(10);
+		}
+	}
+
+	if (!got_ok) {
+		Platform_LogConst("No serial cable detected");
+		return false; // caller restores the port for W5500/BBA/modem fallback
+	}
+
+	Platform_LogConst("DreamPi found! Dialling..");
+	timer_spin_sleep(100);
+	scif_drain();
+	scif_write_string("ATDT\r\n"); scif_flush();
+	timer_spin_sleep(100);
+
+	memset(buf, 0, sizeof(buf));
+	bytes_read = 0;
+	start_time = timer_ms_gettime64();
+	while ((timer_ms_gettime64() - start_time) < SERIAL_CONN_TIMEOUT) {
+		c = scif_read();
+		if (c != -1 && bytes_read < (int)sizeof(buf) - 1) {
+			buf[bytes_read++] = (char)c;
+			buf[bytes_read]   = '\0';
+			if (strstr(buf, "CONNECT")) break;
+		}
+		timer_spin_sleep(10);
+	}
+	if (!strstr(buf, "CONNECT")) {
+		Platform_LogConst("Serial dial failed (no CONNECT)");
+		return false;
+	}
+
+	// DreamPi spins up pppd after CONNECT; give it time, then drain leftovers
+	Platform_LogConst("Connected! Waiting for PPP..");
+	timer_spin_sleep(6000);
+	scif_drain();
+
+	if (ppp_init() < 0) {
+		Platform_LogConst("PPP init failed"); return false;
+	}
+	if (ppp_scif_init(115200) < 0) {
+		Platform_LogConst("PPP serial init failed"); ppp_shutdown(); return false;
+	}
+	ppp_set_login("dream", "dreamcast");
+
+	Platform_LogConst("Connecting link (serial)..");
+	if (ppp_connect()) {
+		Platform_LogConst("Serial PPP connect failed"); ppp_shutdown(); return false;
+	}
+
+	Platform_LogConst("Connected via serial cable!");
+	return net_default_dev != NULL;
+}
+
+// Restore SCIF + debug logging after a failed serial attempt, so the W5500 / SD /
+//  BBA / modem fallbacks (and on-screen+serial logging) work normally again.
+static void RestoreSerialPort(void) {
+	ppp_shutdown();
+	scif_init();      // re-init UART hardware to a known state
+	dbgio_enable();   // allow serial debug logging again for the fallback paths
+	log_debugger = true;
+}
+
 static void InitModem(void) {
 	int err;
 	Platform_LogConst("Initialising modem..");
@@ -754,13 +901,20 @@ static void InitModem(void) {
 void Platform_Init(void) {
 	Platform_ReadonlyFilesystem = true;
 
+	// Serial coders cable (PPP over SCIF -> DreamPi 2) is tried FIRST and takes
+	//  priority over every other connection method. It owns the serial port, so
+	//  on success we skip W5500 / SD-over-serial entirely. On failure the port is
+	//  restored and we fall through to the normal W5500 -> BBA -> modem chain.
+	if (InitSerialCable()) return;
+	RestoreSerialPort();
+
 	// W5500 net adapter also uses the serial port
 	if (w5500_adapter_init(NULL, true) == 0) {
 		log_debugger = false;
 	} else {
 		TryInitSDCard();
 	}
-	
+
 	if (net_default_dev) return;
 	// in case Broadband Adapter isn't active
 	InitModem();
