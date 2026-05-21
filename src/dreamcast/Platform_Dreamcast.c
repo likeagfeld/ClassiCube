@@ -30,8 +30,13 @@
 #include <dc/modem/modem.h>
 #include <arch/timer.h>
 
+// INIT_QUIET disables KOS's dbgio debug console. This is REQUIRED for the serial
+//  coders cable path: by default KOS binds dbgio to SCIF, and its boot spew + RX
+//  handler contend with PPP-over-SCIF (the Pi's LCP frames get eaten before PPP
+//  sees them, so negotiation never completes). Disabling dbgio frees the port.
 KOS_INIT_FLAGS(INIT_CONTROLLER | INIT_KEYBOARD | INIT_MOUSE |
-               INIT_VMU        | INIT_CDROM    | INIT_NET   | INIT_FS_RAMDISK);
+               INIT_VMU        | INIT_CDROM    | INIT_NET   |
+               INIT_FS_RAMDISK | INIT_QUIET);
 
 const cc_result ReturnCode_FileShareViolation = 1000000000; // not used
 const cc_result ReturnCode_FileNotFound     = ENOENT;
@@ -763,12 +768,13 @@ static cc_bool InitSerialCable(void) {
 	uint64 start_time;
 	int  got_ok = 0;
 
-	Platform_LogConst("Checking for serial cable..");
-
-	// From here on SCIF carries data: kill all serial debug output so it can
-	//  never leak into the AT/PPP stream (the W5500 path re-enables it on fallback).
+	// Kill all serial debug output BEFORE the first log/SCIF access so nothing can
+	//  ever leak into the AT/PPP stream (the W5500 path re-enables it on fallback).
+	//  INIT_QUIET already keeps dbgio off SCIF; this is belt-and-suspenders.
 	log_debugger = false;
 	dbgio_disable();
+
+	Platform_LogConst("Checking for serial cable..");
 
 	// Bring SCIF up in polled mode at the DreamPi 2 serial rate
 	scif_init();
