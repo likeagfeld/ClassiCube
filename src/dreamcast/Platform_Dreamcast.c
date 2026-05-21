@@ -749,7 +749,7 @@ static void TryInitSDCard(void) {
 //  by DreamPi as corruption. So we disable dbgio + serial logging up front and use
 //  only on-screen logging (LogOnscreen, via Platform_LogConst with log_debugger=0).
 
-#define SERIAL_AT_RETRIES   3      // AT probes before giving up (instant when DreamPi answers)
+#define SERIAL_AT_RETRIES   1      // single AT probe, like W5500/BBA/modem (fail fast, fall through)
 #define SERIAL_AT_TIMEOUT   2000   // ms to wait for "OK" per AT probe
 #define SERIAL_CONN_TIMEOUT 5000   // ms to wait for "CONNECT" after dialing
 
